@@ -82,6 +82,9 @@ def login_required(func):
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Login required"}), 401
 
+        print("DEBUG AUTH PREFIX:", repr(auth[:7]), flush=True)
+        print("DEBUG TOKEN LENGTH:", len(auth[7:]), flush=True)
+        
         token = db.session.get(Token, auth[7:])
 
         if token is None:

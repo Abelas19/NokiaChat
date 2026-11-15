@@ -101,8 +101,9 @@ def login_required(func):
 @app.post("/register")
 def register():
     data = request.get_json(silent=True) or {}
-    print("DEBUG JSON:", data)
-    print("DEBUG CONTENT TYPE:", request.content_type)
+
+    print("DEBUG JSON:", data, flush=True)
+    print("DEBUG CONTENT TYPE:", request.content_type, flush=True)
 
     username = data.get("username")
     password = data.get("password")
@@ -217,6 +218,9 @@ def create_conversation():
 @login_required
 def send_message():
     data = request.get_json(silent=True) or {}
+
+    print("DEBUG JSON:", data, flush=True)
+    print("DEBUG CONTENT TYPE:", request.content_type, flush=True)
 
     conversation_id = data.get("conversation_id")
     content = data.get("content", "")

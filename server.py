@@ -1,247 +1,292 @@
 
-import sqlite3
+import os
 import secrets
-
+from pathlib import Path
 from functools import wraps
+
 from flask import Flask, request, jsonify, g
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import relationship
 from werkzeug.security import generate_password_hash, check_password_hash
 
+
 app = Flask(__name__)
-DATABASE = "nokiachat.db"
+
+database_url = os.environ.get("DATABASE_URL")
+
+if database_url:
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace(
+            "postgres://", "postgresql+psycopg://", 1
+        )
+    elif database_url.startswith("postgresql://"):
+        database_url = database_url.replace(
+            "postgresql://", "postgresql+psycopg://", 1
+        )
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+else:
+    db_path = Path(__file__).resolve().parent / "nokiachat.db"
+    app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
+
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
 
 
-def connect_db():
-    db = sqlite3.connect(DATABASE)
-    db.row_factory = sqlite3.Row
-    return db
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(20), unique=True, nullable=False)
+    password = db.Column(db.String(256), nullable=False)
 
 
-def init_db():
-    db = connect_db()
-    db.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL
-    );
+class Token(db.Model):
+    token = db.Column(db.String(100), primary_key=True)
+    user_id = db.Column(db.Integer, ForeignKey("user.id"), nullable=False)
 
-    CREATE TABLE IF NOT EXISTS tokens (
-        token TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL
-    );
 
-    CREATE TABLE IF NOT EXISTS conversations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT NOT NULL,
-        name TEXT
-    );
+class Conversation(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    kind = db.Column(db.String(10), nullable=False)
+    name = db.Column(db.String(60))
 
-    CREATE TABLE IF NOT EXISTS members (
-        conversation_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        PRIMARY KEY (conversation_id, user_id)
-    );
 
-    CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        conversation_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        content TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-    db.commit()
-    db.close()
+class Member(db.Model):
+    conversation_id = db.Column(
+        db.Integer, ForeignKey("conversation.id"), primary_key=True
+    )
+    user_id = db.Column(
+        db.Integer, ForeignKey("user.id"), primary_key=True
+    )
+
+
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    conversation_id = db.Column(
+        db.Integer, ForeignKey("conversation.id"), nullable=False
+    )
+    user_id = db.Column(
+        db.Integer, ForeignKey("user.id"), nullable=False
+    )
+    content = db.Column(db.String(1000), nullable=False)
+    created_at = db.Column(
+        db.DateTime, server_default=db.func.current_timestamp()
+    )
 
 
 def login_required(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         auth = request.headers.get("Authorization", "")
+
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Login required"}), 401
 
-        db = connect_db()
-        user = db.execute("""
-            SELECT users.id, users.username
-            FROM tokens
-            JOIN users ON users.id = tokens.user_id
-            WHERE tokens.token = ?
-        """, (auth[7:],)).fetchone()
-        db.close()
+        token = db.session.get(Token, auth[7:])
+
+        if token is None:
+            return jsonify({"error": "Invalid token"}), 401
+
+        user = db.session.get(User, token.user_id)
 
         if user is None:
             return jsonify({"error": "Invalid token"}), 401
 
         g.user = user
         return func(*args, **kwargs)
+
     return wrapper
 
 
 @app.post("/register")
 def register():
     data = request.get_json(silent=True) or {}
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
+
+    username = data.get("username")
+    password = data.get("password")
+
+    if not isinstance(username, str):
+        return jsonify({"error": "Invalid username"}), 400
+
+    username = username.strip()
 
     if not username or len(username) > 20:
         return jsonify({"error": "Invalid username"}), 400
+
     if not isinstance(password, str) or len(password) < 8:
         return jsonify({"error": "Password too short"}), 400
 
-    db = connect_db()
+    user = User(
+        username=username,
+        password=generate_password_hash(password)
+    )
+
+    db.session.add(user)
+
     try:
-        db.execute(
-            "INSERT INTO users (username, password) VALUES (?, ?)",
-            (username, generate_password_hash(password))
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        db.close()
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
         return jsonify({"error": "Username already exists"}), 409
 
-    db.close()
     return jsonify({"success": True})
 
 
 @app.post("/login")
 def login():
     data = request.get_json(silent=True) or {}
-    db = connect_db()
-    user = db.execute(
-        "SELECT * FROM users WHERE username = ?",
-        (data.get("username", ""),)
-    ).fetchone()
 
-    if user is None or not check_password_hash(
-        user["password"], data.get("password", "")
-    ):
-        db.close()
+    username = data.get("username")
+    password = data.get("password")
+
+    if not isinstance(username, str) or not isinstance(password, str):
+        return jsonify({"error": "Invalid login data"}), 400
+
+    user = User.query.filter_by(username=username).first()
+
+    if user is None or not check_password_hash(user.password, password):
         return jsonify({"error": "Wrong username or password"}), 401
 
-    token = secrets.token_urlsafe(32)
-    db.execute(
-        "INSERT INTO tokens (token, user_id) VALUES (?, ?)",
-        (token, user["id"])
-    )
-    db.commit()
-    db.close()
+    token_value = secrets.token_urlsafe(32)
 
-    return jsonify({"token": token, "username": user["username"]})
+    db.session.add(Token(token=token_value, user_id=user.id))
+    db.session.commit()
+
+    return jsonify({
+        "token": token_value,
+        "username": user.username
+    })
 
 
 @app.post("/conversations")
 @login_required
 def create_conversation():
     data = request.get_json(silent=True) or {}
+
     kind = data.get("kind")
     member_ids = data.get("members", [])
 
     if kind not in ("private", "group"):
         return jsonify({"error": "Invalid conversation type"}), 400
+
     if not isinstance(member_ids, list):
         return jsonify({"error": "Invalid members"}), 400
 
-    try:
-        member_ids = set(member_ids)
-        member_ids.add(g.user["id"])
-        member_ids = sorted(member_ids)
-
-        if kind == "private" and len(member_ids) != 2:
-            return jsonify({"error": "Private chat needs two users"}), 400
-        if kind == "group" and len(member_ids) < 2:
-            return jsonify({"error": "Group needs two users"}), 400
-
-        db = connect_db()
-        placeholders = ",".join("?" for _ in member_ids)
-        users = db.execute(
-            f"SELECT id FROM users WHERE id IN ({placeholders})",
-            tuple(member_ids)
-        ).fetchall()
-
-        if len(users) != len(member_ids):
-            db.close()
-            return jsonify({"error": "Unknown user"}), 400
-
-        name = data.get("name") if kind == "group" else None
-        cur = db.execute(
-            "INSERT INTO conversations (kind, name) VALUES (?, ?)",
-            (kind, name)
-        )
-        conversation_id = cur.lastrowid
-
-        for user_id in member_ids:
-            db.execute(
-                "INSERT INTO members VALUES (?, ?)",
-                (conversation_id, user_id)
-            )
-
-        db.commit()
-        db.close()
-        return jsonify({"conversation_id": conversation_id})
-
-    except (TypeError, ValueError):
+    if any(type(uid) is not int or uid <= 0 for uid in member_ids):
         return jsonify({"error": "Invalid member IDs"}), 400
+
+    member_ids = set(member_ids)
+    member_ids.add(g.user.id)
+    member_ids = sorted(member_ids)
+
+    if kind == "private" and len(member_ids) != 2:
+        return jsonify({"error": "Private chat needs two users"}), 400
+
+    if kind == "group" and len(member_ids) < 2:
+        return jsonify({"error": "Group needs two users"}), 400
+
+    users = User.query.filter(User.id.in_(member_ids)).all()
+
+    if len(users) != len(member_ids):
+        return jsonify({"error": "Unknown user"}), 400
+
+    name = data.get("name") if kind == "group" else None
+
+    if name is not None:
+        if not isinstance(name, str) or len(name) > 60:
+            return jsonify({"error": "Invalid group name"}), 400
+
+    conversation = Conversation(kind=kind, name=name)
+    db.session.add(conversation)
+    db.session.flush()
+
+    for user_id in member_ids:
+        db.session.add(Member(
+            conversation_id=conversation.id,
+            user_id=user_id
+        ))
+
+    db.session.commit()
+
+    return jsonify({"conversation_id": conversation.id})
 
 
 @app.post("/messages")
 @login_required
 def send_message():
     data = request.get_json(silent=True) or {}
+
     conversation_id = data.get("conversation_id")
     content = data.get("content", "")
+
+    if type(conversation_id) is not int:
+        return jsonify({"error": "Invalid conversation ID"}), 400
 
     if not isinstance(content, str) or not content.strip() or len(content) > 1000:
         return jsonify({"error": "Invalid message"}), 400
 
-    db = connect_db()
-    member = db.execute("""
-        SELECT 1 FROM members
-        WHERE conversation_id = ? AND user_id = ?
-    """, (conversation_id, g.user["id"])).fetchone()
+    member = Member.query.filter_by(
+        conversation_id=conversation_id,
+        user_id=g.user.id
+    ).first()
 
     if member is None:
-        db.close()
         return jsonify({"error": "Conversation not found"}), 404
 
-    cur = db.execute("""
-        INSERT INTO messages (conversation_id, user_id, content)
-        VALUES (?, ?, ?)
-    """, (conversation_id, g.user["id"], content.strip()))
+    message = Message(
+        conversation_id=conversation_id,
+        user_id=g.user.id,
+        content=content.strip()
+    )
 
-    message_id = cur.lastrowid
-    db.commit()
-    db.close()
-    return jsonify({"message_id": message_id})
+    db.session.add(message)
+    db.session.commit()
+
+    return jsonify({"message_id": message.id})
 
 
 @app.get("/messages/<int:conversation_id>")
 @login_required
 def get_messages(conversation_id):
     after = request.args.get("after", default=0, type=int)
-    db = connect_db()
 
-    member = db.execute("""
-        SELECT 1 FROM members
-        WHERE conversation_id = ? AND user_id = ?
-    """, (conversation_id, g.user["id"])).fetchone()
+    if after is None or after < 0:
+        return jsonify({"error": "Invalid message ID"}), 400
+
+    member = Member.query.filter_by(
+        conversation_id=conversation_id,
+        user_id=g.user.id
+    ).first()
 
     if member is None:
-        db.close()
         return jsonify({"error": "Conversation not found"}), 404
 
-    messages = db.execute("""
-        SELECT messages.id, users.username,
-               messages.content, messages.created_at
-        FROM messages
-        JOIN users ON users.id = messages.user_id
-        WHERE messages.conversation_id = ? AND messages.id > ?
-        ORDER BY messages.id ASC
-        LIMIT 100
-    """, (conversation_id, after)).fetchall()
+    messages = (
+        db.session.query(Message, User.username)
+        .join(User, User.id == Message.user_id)
+        .filter(
+            Message.conversation_id == conversation_id,
+            Message.id > after
+        )
+        .order_by(Message.id.asc())
+        .limit(100)
+        .all()
+    )
 
-    db.close()
-    return jsonify([dict(row) for row in messages])
+    result = []
+
+    for message, username in messages:
+        result.append({
+            "id": message.id,
+            "username": username,
+            "content": message.content,
+            "created_at": (
+                message.created_at.isoformat()
+                if message.created_at else None
+            )
+        })
+
+    return jsonify(result)
 
 
 @app.get("/health")
@@ -249,6 +294,10 @@ def health():
     return jsonify({"status": "ok", "name": "NokiaChat"})
 
 
+with app.app_context():
+    db.create_all()
+
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="127.0.0.1", port=5000, debug=False)
+

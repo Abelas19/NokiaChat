@@ -101,6 +101,8 @@ def login_required(func):
 @app.post("/register")
 def register():
     data = request.get_json(silent=True) or {}
+    print("DEBUG JSON:", data)
+    print("DEBUG CONTENT TYPE:", request.content_type)
 
     username = data.get("username")
     password = data.get("password")

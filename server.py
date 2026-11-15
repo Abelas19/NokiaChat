@@ -219,7 +219,7 @@ def send_message():
     conversation_id = data.get("conversation_id")
     content = data.get("content", "")
 
-    if type(conversation_id) is not int:
+    if isinstance(conversation_id, bool) or not isinstance(conversation_id, int):
         return jsonify({"error": "Invalid conversation ID"}), 400
 
     if not isinstance(content, str) or not content.strip() or len(content) > 1000:

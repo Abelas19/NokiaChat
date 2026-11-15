@@ -220,7 +220,13 @@ def send_message():
     content = data.get("content", "")
 
     if isinstance(conversation_id, bool) or not isinstance(conversation_id, int):
-        return jsonify({"error": "Invalid conversation ID"}), 400
+        return jsonify({
+            "error": "Invalid conversation ID",
+            "received": repr(conversation_id),
+            "type": str(type(conversation_id)),
+         "content_type": request.content_type
+        }), 400
+        
 
     if not isinstance(content, str) or not content.strip() or len(content) > 1000:
         return jsonify({"error": "Invalid message"}), 400
